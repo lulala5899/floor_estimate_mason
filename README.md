@@ -217,7 +217,7 @@ temperature: 29.49
 
 ### 不同楼层测试气压
 
-<a href='https://postimages.org/' target='_blank'><img src='https://i.postimg.cc/WprsK6tM/jie-tu-2026-04-08-15-52-13.png' border='0' alt='jie-tu-2026-04-08-15-52-13'></a>
+<a href='https://postimages.org/' target='_blank'><img src='https://i.postimg.cc/Wprs6KtM/jie-tu-2026-04-08-15-52-13.png' border='0' alt='jie-tu-2026-04-08-15-52-13'></a>
 
 - 得到在一楼气压稳定为1006.00 在三楼气压大概为1005.51
 
