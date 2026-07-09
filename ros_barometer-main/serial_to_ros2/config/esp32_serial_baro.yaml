@@ -1,0 +1,23 @@
+esp32_serial_baro:
+  ros__parameters:
+    serial_port: /dev/ttyACM0
+    output_mode: base-relative
+    frequency: 5.0
+    # Optional: base ESP32 LAN IP for direct /clientip registration.
+    # Leave empty when using the base-laptop relay + Tailscale workflow.
+    base_ip: ''
+    base_pressure_port: 18080
+    default_local_pressure: 1004.0
+    longitude: 121.6
+    latitude: 31.68
+    cali_offsets:
+      # Replace these keys with your board MACs in underscore form.
+      # Example conversion: AA:BB:CC:DD:EE:FF -> AA_BB_CC_DD_EE_FF
+      MOBILE_MAC_UNDERSCORE:
+        pressure_offset: 0.0
+        temperature_offset: 0.0
+        linear_factor: 1.0
+      BASE_MAC_UNDERSCORE:
+        pressure_offset: 0.0
+        temperature_offset: 0.0
+        linear_factor: 1.0

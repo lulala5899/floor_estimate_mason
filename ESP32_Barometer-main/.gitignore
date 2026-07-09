@@ -1,0 +1,48 @@
+# PlatformIO 构建输出目录
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# VSCode 相关的配置文件和目录
+.vscode/
+
+# 编译过程中产生的临时文件
+*.o
+*.a
+*.elf
+*.hex
+*.bin
+*.map
+*.d
+
+# 操作系统生成的文件
+.DS_Store    # macOS 系统文件
+Thumbs.db    # Windows 缩略图缓存
+desktop.ini  # Windows 文件夹设置
+
+# 编辑器临时文件和备份
+*~
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# 调试和日志文件
+*.log
+debug/
+debug.cfg
+debug_custom.json
+
+# 项目特定的构建输出
+build/
+dist/
+Release/
+Debug/
+
+# 用户特定的环境文件（可能包含敏感信息）
+platformio.ini.private
+secrets.h
+credentials.h
+
+# PlatformIO prebuild output
+src/main.cpp

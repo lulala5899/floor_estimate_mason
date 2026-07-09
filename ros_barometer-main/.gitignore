@@ -1,0 +1,6 @@
+.texpadtmp
+.DS_Store
+__pycache__/
+.vscode/
+.env
+*.egg-info
