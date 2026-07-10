@@ -309,7 +309,7 @@ class PressureNode(Node):
         return False
 
     async def close_serial_connection(self):
-        """Close serial connection safely"""
+        """Close serial connection safely and reset debouncing state"""
         try:
             if self.serial_writer:
                 self.serial_writer.close()
@@ -319,6 +319,11 @@ class PressureNode(Node):
         finally:
             self.serial_reader = None
             self.serial_writer = None
+            # Clear stale data that would contaminate median filter after reconnect
+            self._altitude_buffer.clear()
+            self._velocity_buffer.clear()
+            self._pending_candidate = None
+            self._floor_consecutive_count = 0
 
     def _send_mac_address(self):
         """Send MAC address request with serial to identify which barometer is connected"""
