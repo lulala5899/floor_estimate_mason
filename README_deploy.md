@@ -152,7 +152,7 @@ ros2 topic echo /floor_state
 做法：用一对虚拟串口（`socat` 工具可以创建一对互通的虚拟串口）代替真实 ESP32，往
 其中一端灌自己编的气压曲线（模拟"匀速上升两层楼后停住"之类的场景），ROS2 节点连接
 另一端，把 `serial_port` 参数指向这个虚拟串口即可。这样可以不依赖硬件、几秒钟内把
-一次电梯行程重放几十遍，专门用来调 `floor_debounce_*` 和 `motion_gate_*` 这几个参数。
+一次电梯行程重放几十遍，专门用来调 `floor_stability_window` 和 `mount_height_offset` 这几个参数。
 
 ## 调试阶段大概率要改的参数
 
@@ -163,17 +163,15 @@ ros2 topic echo /floor_state
 | `serial_port` | `/dev/ttyACM0` | 虚拟机里 USB 直通后设备名可能变成 `ttyACM1` 等，用 `ls /dev/ttyACM*` 确认 |
 | `floor_height` | `3.0` | 用实际测试环境的层高替换（如果暂时没有真实电梯环境，先随便定一个值，后面在真机场景重新标定）|
 | `calibration_duration` | `10.0` | 调试阶段建议先调小（比如 3～5 秒），这样每次重启节点不用等 10 秒，反复测试更快；调试完成后再改回 10 秒左右保证真实精度 |
-| `floor_debounce_buffer_size` | `10` | 如果发现楼层反应太慢，调小；如果发现还在抖，调大 |
-| `floor_debounce_consecutive` | `5` | 同上，调试阶段最值得反复试的参数之一 |
-| `floor_debounce_deadband` | `0.3` | 如果楼层号在两层间来回跳，适当调大；如果反应太迟钝，调小 |
-| `motion_gate_speed_threshold` | `0.15` | 这个值和"电梯有多快、多平稳"强相关，虚拟机场景下你手动移动设备的速度和真实电梯完全不同，**这个参数在虚拟机里调出来的值到了真机大概率还要重新调**，先在这里留个印象，后面场景二会再提一次 |
-| `motion_gate_window` | `10` | 和上面一起调 |
+| `mount_height_offset` | `1.0` | 传感器安装高度（传感器到地面），减掉后海拔以机器人底座为基准，让零点远离楼层分界线 |
+| `floor_stability_window` | `5` | 稳定窗口宽度。数值越大，噪声抑制越好但响应越慢；越小则楼层变化响应越快 |
+| `floor_state_heartbeat` | `1.0` | /floor_state 心跳重发间隔（秒），0 则禁用 |
 
 可以不改配置文件，用命令行临时覆盖某个参数快速试验：
 
 ```bash
 ros2 run serial_to_ros2 esp32_serial_baro --ros-args \
-    -p floor_debounce_consecutive:=8 -p floor_debounce_deadband:=0.5
+    -p floor_stability_window:=8 -p mount_height_offset:=1.2
 ```
 
 ---
@@ -311,8 +309,8 @@ journalctl -u floor-estimate.service -f
 
 | 参数 | 为什么真机上通常要重调 |
 |---|---|
-| `motion_gate_speed_threshold` / `motion_gate_window` | 虚拟机调试时是你手动移动设备，速度曲线和真实电梯完全不同；真实电梯有明显的加速-匀速-减速过程，需要用真实电梯数据重新标定"多慢算停止" |
-| `floor_debounce_deadband` | G1 自身的振动、风扇气流会引入虚拟机场景里没有的额外噪声，可能需要适当调大死区 |
+| `mount_height_offset` | 不同机器人传感器安装高度不同，虚拟机调试时设定的偏移量可能不精确，需要根据实际安装位置重新测量 |
+| `floor_stability_window` | G1 自身的振动、风扇气流会引入虚拟机场景里没有的额外噪声，可能需要适当调大窗口值 |
 | `floor_height` | 用实际要部署的那栋楼的真实层高替换调试阶段的占位值 |
 | `calibration_duration` | 调试阶段为了测试方便调小过的话，真机上建议调回 10 秒左右，保证基准气压足够准 |
 | `serial_port` | 见上面"USB 口固定"那条，用 udev 规则配好的固定设备名 |
@@ -341,7 +339,7 @@ colcon build --symlink-install
 ```
 
 **Q: 楼层号在真机上比虚拟机测试时更容易乱跳**
-A: 大概率是风扇/振动噪声比预期大，按上面第 8 点先调大 `floor_debounce_deadband`，
+A: 大概率是风扇/振动噪声比预期大，按上面第 8 点先调大 `floor_stability_window`，
 再检查气压计有没有做防风处理（进气孔加海绵/无纺布）。
 
 **Q: `/floor_estimate` 和 `/floor_state` 该用哪个？**

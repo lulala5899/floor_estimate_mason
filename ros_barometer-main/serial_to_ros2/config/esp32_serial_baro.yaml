@@ -7,11 +7,9 @@ esp32_serial_baro:
     # Baseline calibration: on startup, average pressure for N seconds as UG reference
     calibration_duration: 10.0
     floor_height: 3.0
-    # Floor debouncing
-    floor_debounce_buffer_size: 10
-    floor_debounce_consecutive: 5
-    floor_debounce_deadband: 0.3
+    # Sensor offset: subtracts mount height so altitude is ground-relative
+    mount_height_offset: 1.0
+    # Floor stability: how many raw floor samples must match to confirm stable
+    floor_stability_window: 5
+    # Heartbeat: unconditional /floor_state re-publish interval (0 to disable)
     floor_state_heartbeat: 1.0
-    # Motion gating
-    motion_gate_speed_threshold: 0.15
-    motion_gate_window: 10
