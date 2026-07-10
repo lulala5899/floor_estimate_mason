@@ -7,7 +7,7 @@
 #include "config.h"
 
 // Configuration
-#define DATA_COLLECTION_INTERVAL 150            // 150 milliseconds
+#define DATA_COLLECTION_INTERVAL 50              // 50 milliseconds
 #define TIME_SYNC_INTERVAL (60 * 60 * 2 * 1000) // 2 hour in milliseconds
 
 // define onboard LED pin
@@ -60,13 +60,23 @@ void loop()
     // Process any incoming messages
     processSerialInput();
 
-    // Check if time is synchronized and request time sync if not
     unsigned long currentMillis = millis();
-    if ((!timeIsSynchronized) || (currentMillis - lastTimeSync >= TIME_SYNC_INTERVAL))
+
+    // Non-blocking time sync: send request every 1s until synced
+    if (!timeIsSynchronized && (currentMillis - lastTimeSync >= 1000))
     {
-        requestTimeSync();
+        Serial.println("BAROT>" + deviceMac);
+        lastTimeSync = currentMillis;
     }
-    // Collect data every DATA_COLLECTION_INTERVAL
+
+    // Periodic re-sync every 2 hours
+    if (timeIsSynchronized && (currentMillis - lastTimeSync >= TIME_SYNC_INTERVAL))
+    {
+        Serial.println("BAROT>" + deviceMac);
+        lastTimeSync = currentMillis;
+    }
+
+    // Collect data every DATA_COLLECTION_INTERVAL (non-blocking)
     if (currentMillis - lastDataCollectionTime >= DATA_COLLECTION_INTERVAL)
     {
         lastDataCollectionTime = currentMillis;

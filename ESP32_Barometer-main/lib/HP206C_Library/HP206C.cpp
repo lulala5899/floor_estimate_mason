@@ -15,7 +15,7 @@ bool HP206C::configureSensor() {
     if (bmp_.setPressureOversampling(BMP3_OVERSAMPLING_4X) == false) {
         return false;
     }
-    if (bmp_.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3) == false) {
+    if (bmp_.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_1) == false) {
         return false;
     }
     if (bmp_.setOutputDataRate(BMP3_ODR_50_HZ) == false) {

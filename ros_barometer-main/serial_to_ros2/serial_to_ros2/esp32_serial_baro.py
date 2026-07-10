@@ -16,6 +16,7 @@ from rcl_interfaces.msg import ParameterDescriptor
 from ament_index_python.packages import get_package_share_directory
 from sensor_msgs.msg import FluidPressure
 from std_msgs.msg import Header
+from std_msgs.msg import Int32, Float32
 
 from barometer_interfaces.msg import Barometer, ZMotion
 
@@ -95,12 +96,22 @@ class PressureNode(Node):
         self._prev_t = None       # previous time (seconds)
         self._prev_v = 0.0        # previous vertical speed (m/s)
 
+        # Baseline calibration state
+        self.calibration_start_time = None
+        self.calibration_pressures = []
+        self.baseline_complete = False
+        self.current_floor = 0
+
         self.pub_pressure = self.create_publisher(
             FluidPressure, '/pressure', 10)
         self.pub_barometer = self.create_publisher(
             Barometer, '/barometer', 10)
         self.pub_zmotion = self.create_publisher(
             ZMotion, '/z_motion', 10)
+        self.pub_baseline_pressure = self.create_publisher(
+            Float32, '/baseline_pressure', 10)
+        self.pub_floor_estimate = self.create_publisher(
+            Int32, '/floor_estimate', 10)
 
         self.sub_barometer = self.create_subscription(
             Barometer, '/barometer', self._sub_barometer_callback, 10)
@@ -169,7 +180,25 @@ class PressureNode(Node):
         # Store the default value to check if user provided a custom value
         self.default_local_pressure_default = default_params.get('default_local_pressure', 1010.0)
         self.user_provided_local_pressure = (self.default_local_pressure != self.default_local_pressure_default)
-        
+
+        self.declare_parameter(
+            'calibration_duration',
+            10.0,
+            ParameterDescriptor(
+                description='Seconds to collect pressure data on startup for UG baseline calibration')
+        )
+        self.calibration_duration = self.get_parameter(
+            'calibration_duration').get_parameter_value().double_value
+
+        self.declare_parameter(
+            'floor_height',
+            3.0,
+            ParameterDescriptor(
+                description='Height of each floor in meters, for floor estimation')
+        )
+        self.floor_height = self.get_parameter(
+            'floor_height').get_parameter_value().double_value
+
         self.declare_parameter(
             'longitude',
             default_params.get('longitude', 121.60),
@@ -384,6 +413,36 @@ class PressureNode(Node):
             pressure_hpa = pressure_from_sensor + self.pressure_offset
             pressure_pa = pressure_hpa * 100.0
             temperature = temp_from_sensor + self.temperature_offset
+
+            # --- Baseline calibration phase ---
+            if not self.baseline_complete:
+                if self.calibration_start_time is None:
+                    self.calibration_start_time = time.time()
+                    self._info(f"Starting baseline calibration: collecting pressure for {self.calibration_duration}s")
+
+                elapsed = time.time() - self.calibration_start_time
+                self.calibration_pressures.append(pressure_hpa)
+                self._debug(f"Calibration sample {len(self.calibration_pressures)}: {pressure_hpa:.2f} hPa")
+
+                if elapsed >= self.calibration_duration:
+                    self.default_local_pressure = sum(self.calibration_pressures) / len(self.calibration_pressures)
+                    self.baseline_complete = True
+                    self._info(
+                        f"Baseline calibration done: {self.default_local_pressure:.2f} hPa "
+                        f"(UG layer, {len(self.calibration_pressures)} samples over {elapsed:.1f}s)")
+                    self.pub_baseline_pressure.publish(Float32(data=float(self.default_local_pressure)))
+
+                # During calibration, still publish raw pressure (without altitude)
+                self.pub_pressure.publish(
+                    FluidPressure(
+                        header=header,
+                        fluid_pressure=pressure_pa,
+                        variance=0.0
+                    )
+                )
+                return
+
+            # --- Normal operation (after calibration) ---
             altitude = self._altitude_from_pressure(pressure_hpa, temperature)
 
             if math.isnan(altitude) or math.isinf(altitude):
@@ -391,7 +450,7 @@ class PressureNode(Node):
                         f"Input P={pressure_hpa:.2f}, T={temperature:.2f}, "
                         f"BaseP={self.default_local_pressure:.2f}")
                 return None
-        
+
             self.pub_pressure.publish(
                 FluidPressure(
                     header=header,
@@ -407,6 +466,10 @@ class PressureNode(Node):
                     altitude=altitude
                 )
             )
+
+            # --- Floor estimate ---
+            self.current_floor = int(round(altitude / self.floor_height))
+            self.pub_floor_estimate.publish(Int32(data=self.current_floor))
         except Exception as e:
             self._warn(f'Parse error: {e}')
             return None
@@ -787,18 +850,11 @@ async def async_main(args=None):
         )
         # Create serial reader task
         serial_task = asyncio.create_task(node.serial_reader_task())
-        
-        if not node.user_provided_local_pressure:
-            # Fetch local pressure if not set
-            local_pressure = await node.fetch_local_pressure()
-            node._info(f"Fetched local pressure from API: {local_pressure} hPa")
-            if not math.isnan(local_pressure):
-                # Only update the pressure if the fetched value is valid.
-                node.default_local_pressure = local_pressure
-                node._info(f"Using fetched local pressure: {node.default_local_pressure} hPa")
-            else:
-                # If fetching fails, keep the default value and warn the user.
-                node._warn(f"Failed to fetch local pressure. Falling back to default value: {node.default_local_pressure} hPa")
+
+        # In-situ baseline calibration is done in _serial_raw_to_pressure on startup,
+        # so skip the Open-Meteo API fetch. default_local_pressure from YAML is used
+        # as a temporary fallback until calibration (10s) completes.
+        node._info("Baseline pressure will be calibrated from sensor data on startup (10s)")
             
         if node.output_mode == "base-relative":
             # Start base pressure server task
