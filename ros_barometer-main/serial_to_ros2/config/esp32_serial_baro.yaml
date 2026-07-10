@@ -7,3 +7,11 @@ esp32_serial_baro:
     # Baseline calibration: on startup, average pressure for N seconds as UG reference
     calibration_duration: 10.0
     floor_height: 3.0
+    # Floor debouncing
+    floor_debounce_buffer_size: 10
+    floor_debounce_consecutive: 5
+    floor_debounce_deadband: 0.3
+    floor_state_heartbeat: 1.0
+    # Motion gating
+    motion_gate_speed_threshold: 0.15
+    motion_gate_window: 10

@@ -140,18 +140,20 @@ ROS2 节点进入校准阶段（默认 10 秒）
 
 ### 楼层防抖机制
 
-气压噪声和气流扰动可能使原始海拔在小范围内波动，导致 `/floor_estimate` 频繁跳变。系统的**两层防抖**方案：
+气压噪声和气流扰动可能使原始海拔在小范围内波动，导致 `/floor_estimate` 频繁跳变。系统的**四层防抖**方案：
 
 ```
 原始海拔 (20Hz)
-  ↓ 存入 10 帧环形缓冲区
-中值滤波 → 取缓冲区中位数海拔 → 候选楼层号
-  ↓ 连续 5 帧一致才认可
-防抖确认 → 更新 /floor_state
+  ↓ 存入环形缓冲区（默认 10 帧）
+中值滤波 → 去中位数 → 候选楼层号
+  ↓ 死区检测：越过楼层边界至少 0.3m 才考虑变化（抗气压漂移）
+  ↓ 连续一致确认：必须同一个候选值持续 N 帧（默认 5 帧≈250ms）
+  ↓ 运动门控：竖直速度回落到 0.15m/s 以下才提升给 /floor_state
+最终确认 → 更新 /floor_state（TRANSIENT_LOCAL QoS，1Hz 心跳重发）
 ```
 
 - `/floor_estimate` — **无防抖**，保留实时性，适合需要快速响应的场景
-- `/floor_state` — **防抖确认**后发布，中值滤波 + 连续 5 帧（~250ms，20Hz下）一致才更新，适合 UI 显示和稳态逻辑判断
+- `/floor_state` — 四项防抖全部通过后才更新。QoS 为 TRANSIENT_LOCAL depth=1，新订阅者连上即能获取最后一次楼层值，同时 1Hz 心跳无条件重发当前值
 
 ### 固件数据流
 
@@ -180,7 +182,9 @@ _process_serial_line → _serial_raw_to_pressure
   │                    发 /baseline_pressure（仅一次）
   │
   └─ 校准完成: 算 ISA 海拔 → 发 /barometer（含 altitude）
-                          → 中值滤波(10帧) → 防抖 → 发 /floor_state
+                          → 中值滤波(10帧) → 死区检测(0.3m)
+                          → 同候选连续确认(5帧) → 运动门控
+                          → 发 /floor_state
                           → 实时算楼层 → 发 /floor_estimate（无防抖）
                           → 回读 /barometer
                               → 有限差分法算垂直速度/加速度
@@ -198,7 +202,7 @@ _process_serial_line → _serial_raw_to_pressure
 | `/z_motion` | `barometer_interfaces/ZMotion` | ~20Hz | 垂直速度(vspeed)和加速度(vacc) |
 | `/baseline_pressure` | `std_msgs/Float32` | 仅 1 次 | UG 层基准气压值(hPa)，校准完成时发布 |
 | `/floor_estimate` | `std_msgs/Int32` | ~20Hz | 当前楼层号（0=UG, 1=1F, -1=B1），校准后才发布，无防抖 |
-| `/floor_state` | `std_msgs/Int32` | 变化时 | 防抖确认后的楼层号，中值滤波 + 连续 5 帧一致才更新，适合稳态判断 |
+| `/floor_state` | `std_msgs/Int32` | 变化时 + 1Hz 心跳 | 四层防抖(中值滤波+死区+连续确认+运动门控)确认后的楼层号。QoS TRANSIENT_LOCAL，新订阅者立刻拿到最新值 |
 
 ### 话题消息结构
 
@@ -232,6 +236,12 @@ esp32_serial_baro:
     default_local_pressure: 1004.0     # 校准前的临时参考气压（会被校准值覆盖）
     calibration_duration: 10.0         # 上电采集校准时长（秒）
     floor_height: 3.0                  # 每层楼高度（米）
+    floor_debounce_buffer_size: 10     # 中值滤波窗口（帧数）
+    floor_debounce_consecutive: 5      # 同候选连续确认帧数
+    floor_debounce_deadband: 0.3       # 楼层边界死区（米）
+    floor_state_heartbeat: 1.0         # /floor_state 心跳重发间隔（秒）
+    motion_gate_speed_threshold: 0.15  # 运动门控速度阈值（m/s）
+    motion_gate_window: 10             # 速度平均窗口（帧数）
 ```
 
 ### 参数说明
@@ -243,6 +253,12 @@ esp32_serial_baro:
 | `floor_height` | `3.0` | 每层楼高度（米），用于计算楼层号 |
 | `default_local_pressure` | `1004.0` | 校准前的临时值，校准完成后会被自动覆盖 |
 | `frequency` | `5.0` | 内部轮询频率（实际数据率由 ESP32 20Hz 主导） |
+| `floor_debounce_buffer_size` | `10` | 中值滤波窗口大小（帧），越大越平滑但响应越慢 |
+| `floor_debounce_consecutive` | `5` | 同一候选楼层需连续确认多少帧才锁定 |
+| `floor_debounce_deadband` | `0.3` | 楼层边界死区（米），防止气压漂移导致误判 |
+| `floor_state_heartbeat` | `1.0` | /floor_state 心跳重发间隔（秒），0 则禁用 |
+| `motion_gate_speed_threshold` | `0.15` | 电梯静止判定：平均|速度|低于此值（m/s）才提交楼层 |
+| `motion_gate_window` | `10` | 速度平均窗口（帧数），越大越不易被瞬时噪声误触发 |
 
 ---
 
@@ -399,7 +415,9 @@ A: 把命令中的 `humble` 替换为你的 ROS2 版本即可（如 `jazzy`、`r
 │    │                                             │
 │    └─ [正常运行] ISA海拔换算 → /barometer         │
 │                             → /floor_estimate    │
-│                             → 防抖确认 → /floor_state    │
+│                             → 中值滤波→死区检测→ │
+│                               连续确认→运动门控  │
+│                             → /floor_state       │
 │                             → /z_motion          │
 │                                                  │
 │  Publishers:                                     │
@@ -408,6 +426,6 @@ A: 把命令中的 `humble` 替换为你的 ROS2 版本即可（如 `jazzy`、`r
 │    /z_motion          (ZMotion)                  │
 │    /baseline_pressure (Float32, 仅一次)           │
 │    /floor_estimate    (Int32, 实时)              │
-│    /floor_state       (Int32, 防抖, 变化时)       │
+│    /floor_state       (Int32, 防抖, 1Hz心跳)      │
 └─────────────────────────────────────────────────┘
 ```

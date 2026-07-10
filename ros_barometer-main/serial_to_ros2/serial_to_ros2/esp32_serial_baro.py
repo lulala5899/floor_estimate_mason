@@ -12,6 +12,7 @@ import concurrent.futures
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
+from rclpy.qos import QoSProfile, DurabilityPolicy
 from rcl_interfaces.msg import ParameterDescriptor
 from ament_index_python.packages import get_package_share_directory
 from sensor_msgs.msg import FluidPressure
@@ -30,11 +31,6 @@ if venv := os.environ.get('VIRTUAL_ENV'):
 import serial_asyncio
 import serial
 import serial.tools.list_ports
-
-
-# Floor debouncing constants
-FLOOR_DEBOUNCE_CONSECUTIVE = 5   # consecutive consistent samples to latch
-FLOOR_ALTITUDE_BUFFER_SIZE = 10  # number of altitude samples for median filter
 
 
 def find_serial_port() -> str:
@@ -103,9 +99,17 @@ class PressureNode(Node):
         self.current_floor = 0
 
         # Floor debouncing state
-        self._altitude_buffer = []           # circular buffer of recent altitudes
-        self._floor_latched = None           # confirmed floor (after debouncing)
-        self._floor_consecutive_count = 0    # how many samples consistent with new floor
+        self._altitude_buffer = []              # circular buffer of recent altitudes
+        self._floor_latched = None              # confirmed floor (after debouncing)
+        self._floor_consecutive_count = 0       # how many consecutive same-pending samples
+        self._pending_candidate = None          # candidate floor being confirmed
+        self._velocity_buffer = []              # recent vertical speeds for stop detection
+
+        # Floor state publisher with TRANSIENT_LOCAL so late subscribers get the last value
+        floor_state_qos = QoSProfile(
+            depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.pub_floor_state = self.create_publisher(
+            Int32, '/floor_state', floor_state_qos)
 
         self.pub_pressure = self.create_publisher(
             FluidPressure, '/pressure', 10)
@@ -117,8 +121,6 @@ class PressureNode(Node):
             Float32, '/baseline_pressure', 10)
         self.pub_floor_estimate = self.create_publisher(
             Int32, '/floor_estimate', 10)
-        self.pub_floor_state = self.create_publisher(
-            Int32, '/floor_state', 10)
 
         self.sub_barometer = self.create_subscription(
             Barometer, '/barometer', self._sub_barometer_callback, 10)
@@ -172,10 +174,68 @@ class PressureNode(Node):
         self.floor_height = self.get_parameter(
             'floor_height').get_parameter_value().double_value
 
+        self.declare_parameter(
+            'floor_debounce_buffer_size',
+            10,
+            ParameterDescriptor(
+                description='Number of altitude samples for median filter in floor debouncing')
+        )
+        self.floor_debounce_buffer_size = self.get_parameter(
+            'floor_debounce_buffer_size').get_parameter_value().integer_value
+
+        self.declare_parameter(
+            'floor_debounce_consecutive',
+            5,
+            ParameterDescriptor(
+                description='Consecutive consistent candidate samples required to latch a new floor')
+        )
+        self.floor_debounce_consecutive = self.get_parameter(
+            'floor_debounce_consecutive').get_parameter_value().integer_value
+
+        self.declare_parameter(
+            'floor_debounce_deadband',
+            0.3,
+            ParameterDescriptor(
+                description='Minimum meters past floor boundary required to consider a floor change')
+        )
+        self.floor_debounce_deadband = self.get_parameter(
+            'floor_debounce_deadband').get_parameter_value().double_value
+
+        self.declare_parameter(
+            'floor_state_heartbeat',
+            1.0,
+            ParameterDescriptor(
+                description='Seconds between unconditional /floor_state re-publishes (0 to disable)')
+        )
+        floor_state_heartbeat = self.get_parameter(
+            'floor_state_heartbeat').get_parameter_value().double_value
+
+        self.declare_parameter(
+            'motion_gate_speed_threshold',
+            0.15,
+            ParameterDescriptor(
+                description='Max mean |vertical speed| (m/s) to consider elevator stopped')
+        )
+        self.motion_gate_speed_threshold = self.get_parameter(
+            'motion_gate_speed_threshold').get_parameter_value().double_value
+
+        self.declare_parameter(
+            'motion_gate_window',
+            10,
+            ParameterDescriptor(
+                description='Number of velocity samples to average for stop detection')
+        )
+        self.motion_gate_window = self.get_parameter(
+            'motion_gate_window').get_parameter_value().integer_value
+
         self.mac_address: str | None = None
         self.mac_timer = self.create_timer(1.0, self._send_mac_address)
         self.pressure_offset = 0.0
         self.temperature_offset = 0.0
+
+        # 1Hz heartbeat: re-publish latched floor so late subscribers always get a value
+        if floor_state_heartbeat > 0.0:
+            self.create_timer(floor_state_heartbeat, self._publish_floor_state_heartbeat)
 
         self._info('PressureNode has been started.')
 
@@ -313,6 +373,12 @@ class PressureNode(Node):
         self._prev_t = t_now
         self._prev_v = v_now
 
+        # Maintain velocity buffer for motion gating
+        self._velocity_buffer.append(abs(v_now))
+        window = self.motion_gate_window
+        if len(self._velocity_buffer) > window:
+            self._velocity_buffer.pop(0)
+
     def _send_time_sync(self):
         """Send time sync timestamp to esp32 to sync with host machine"""
         if self.serial_writer is None:
@@ -327,18 +393,43 @@ class PressureNode(Node):
         except Exception as e:
             self._error(f"Failed to send time sync: {e}")
 
+    def _publish_floor_state_heartbeat(self):
+        """Unconditional 1Hz re-publish so late /floor_state subscribers always get a value."""
+        if self._floor_latched is not None:
+            self.pub_floor_state.publish(Int32(data=self._floor_latched))
+
+    def _is_elevator_stopped(self) -> bool:
+        """Check if elevator is stationary using mean absolute velocity over a window."""
+        if len(self._velocity_buffer) < self.motion_gate_window // 2:
+            return True  # not enough data yet, assume stopped
+        mean_speed = sum(self._velocity_buffer) / len(self._velocity_buffer)
+        return mean_speed < self.motion_gate_speed_threshold
+
+    def _is_beyond_deadband(self, median_alt: float, candidate_floor: int) -> bool:
+        """
+        Check if median altitude has crossed the floor boundary by at least deadband meters.
+        This prevents long-term pressure drift from triggering spurious floor changes.
+        """
+        # boundary between latched_floor and candidate_floor
+        lo = min(self._floor_latched, candidate_floor)
+        boundary = (lo + 0.5) * self.floor_height
+        return abs(median_alt - boundary) > self.floor_debounce_deadband
+
     def _compute_debounced_floor(self, altitude: float) -> int | None:
         """
-        Debounce floor estimate using median filter + consecutive confirmation.
-        Maintains an internal altitude buffer and latched floor state.
-        Returns new floor value when latched, None otherwise.
+        Debounce floor estimate:
+          - Median filter over a rolling buffer
+          - Track only one _pending_candidate at a time (reset on change)
+          - Only commit when elevator is stationary (motion gating)
+          - Dead-band around floor boundaries to resist drift
+          - Consecutive frame confirmation before latching
+        Returns new floor when latched, None otherwise.
         """
         # Maintain circular buffer of altitudes
         self._altitude_buffer.append(altitude)
-        if len(self._altitude_buffer) > FLOOR_ALTITUDE_BUFFER_SIZE:
+        if len(self._altitude_buffer) > self.floor_debounce_buffer_size:
             self._altitude_buffer.pop(0)
 
-        # Compute median-based floor from buffer
         sorted_alt = sorted(self._altitude_buffer)
         median_alt = sorted_alt[len(sorted_alt) // 2]
         candidate_floor = int(round(median_alt / self.floor_height))
@@ -346,24 +437,42 @@ class PressureNode(Node):
         # First-ever floor: latch immediately
         if self._floor_latched is None:
             self._floor_latched = candidate_floor
-            self._floor_consecutive_count = 0
             return candidate_floor
 
-        # If candidate matches latched floor, reset counter
+        # Same as current latched: idle, reset pending state
         if candidate_floor == self._floor_latched:
+            self._pending_candidate = None
             self._floor_consecutive_count = 0
             return None
 
-        # Candidate differs: increment counter, latch when threshold reached
-        self._floor_consecutive_count += 1
-        if self._floor_consecutive_count >= FLOOR_DEBOUNCE_CONSECUTIVE:
-            old_floor = self._floor_latched
-            self._floor_latched = candidate_floor
+        # New candidate: must be beyond deadband to be considered
+        if not self._is_beyond_deadband(median_alt, candidate_floor):
+            self._pending_candidate = None
             self._floor_consecutive_count = 0
-            self._info(f'Floor latched: {old_floor} -> {candidate_floor}')
-            return candidate_floor
+            return None
 
-        return None
+        # Candidate changed: reset consecutive count, track new one
+        if candidate_floor != self._pending_candidate:
+            self._pending_candidate = candidate_floor
+            self._floor_consecutive_count = 1
+            return None
+
+        # Same candidate as before, increment counter
+        self._floor_consecutive_count += 1
+        if self._floor_consecutive_count < self.floor_debounce_consecutive:
+            return None
+
+        # Consecutive threshold reached: check motion gating
+        if not self._is_elevator_stopped():
+            # still moving, don't commit yet — keep counting
+            return None
+
+        old = self._floor_latched
+        self._floor_latched = candidate_floor
+        self._pending_candidate = None
+        self._floor_consecutive_count = 0
+        self._info(f'Floor latched: {old} -> {candidate_floor}')
+        return candidate_floor
 
     def _serial_raw_to_pressure(self, line: str):
         try:
