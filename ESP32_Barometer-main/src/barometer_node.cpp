@@ -29,7 +29,6 @@ bool timeIsSynchronized = false;
 
 // Function declarations
 void collectAndSendData();
-void requestTimeSync();
 void processTimeinfo(unsigned long long timestamp);
 void sendMACAddress();
 bool processSerialInput();
@@ -195,21 +194,6 @@ void collectAndSendData()
     Serial.print(pressure, 2);
     Serial.print(",");
     Serial.println(temperature, 2);
-}
-
-void requestTimeSync()
-{
-    Serial.println("BAROT>" + deviceMac);
-    // Wait for time synchronization (with timeout 1s)
-    unsigned long syncStartTime = millis();
-    while (!timeIsSynchronized && (millis() - syncStartTime < 1000))
-    {
-        processSerialInput();
-        if (timeIsSynchronized)
-        {
-            return;
-        }
-    }
 }
 
 void sendMACAddress()

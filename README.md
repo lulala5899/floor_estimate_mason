@@ -1,8 +1,8 @@
 # floor_estimate_mason
 
-基于 **ESP32-S3 + BMP390** 的气压测楼层方案（单板模式）。
+基于 **ESP32-S3 + BMP390** 的气压测楼层方案（单板 self-relative 模式）。
 
-电梯内无 Wi-Fi 信号，双板差分不可行，故本仓库专注于 **单板 self-relative 模式**：一块 ESP32 通过 USB 串口将气压数据发送到电脑，电脑端 ROS2 节点根据本地参考气压换算海拔，实时输出楼层估计。
+电梯内无 Wi-Fi 信号，双板差分不可行，故本仓库专注于 **单板模式**：一块 ESP32 通过 USB 串口将气压数据发送到电脑，电脑端 ROS2 节点根据实地校准的基准气压换算海拔，实时输出楼层估计。
 
 ---
 
@@ -16,7 +16,7 @@
 
 ---
 
-## 1. 接线
+## 接线
 
 ```
 3V3  -> BMP390 VCC
@@ -31,15 +31,17 @@ SDO  -> GND（地址 0x76）或 3V3（地址 0x77）
 
 ---
 
-## 2. 安装依赖
+## 快速开始
 
-### 2.1 PlatformIO（固件编译）
+### 1. 安装依赖
+
+**PlatformIO（固件编译）**
 
 ```bash
 python3 -m pip install --user -U platformio
 ```
 
-### 2.2 ROS2 Humble
+**ROS2 Humble**
 
 确保已安装 ROS2 Humble，并 source 环境：
 
@@ -47,216 +49,343 @@ python3 -m pip install --user -U platformio
 source /opt/ros/humble/setup.bash
 ```
 
----
-
-## 3. 固件编译与烧录
-
-工程位置：`ESP32_Barometer-main/`
-
-关键配置已在 `platformio.ini` 中预设：
-
-- 环境：`barometer_node_s3`（单板串口输出）
-- I2C 引脚：SDA=41, SCL=42
-- USB CDC 模式已启用（Serial 日志走 `/dev/ttyACM0`）
-
-检测串口设备：
-
-```bash
-ls /dev/ttyACM* 2>/dev/null
-```
-
-编译：
+### 2. 编译烧录 ESP32 固件
 
 ```bash
 cd ESP32_Barometer-main
-python3 -m platformio run -e barometer_node_s3
-```
-
-烧录：
-
-```bash
 python3 -m platformio run -e barometer_node_s3 -t upload --upload-port /dev/ttyACM0
 ```
 
----
+关键配置已预设：
 
-## 4. 串口验证
+| 项目 | 值 |
+|------|-----|
+| 编译环境 | `barometer_node_s3` |
+| I2C 引脚 | SDA=41, SCL=42 |
+| USB 模式 | CDC（日志走 `/dev/ttyACM0`）|
+| 采样间隔 | **50ms（20Hz）** |
+| 传感器 IIR 滤波 | **Coeff 1（轻滤波，低延迟）** |
+| 时间同步 | **非阻塞式，上电即输出数据** |
+
+### 3. 串口验证
 
 ```bash
 python3 -m platformio device monitor -p /dev/ttyACM0 -b 115200
 ```
 
-期望输出格式：
+期望输出：
 
 ```
+INFO: I2C init SDA=41 SCL=42
 BAROD>timestamp,pressure_hpa,temp_c
-BAROT><ESP32_MAC>
-```
-
-实测样例：
-
-```
-BAROD>...,1006.04,28.04
 BAROT>24:EC:4A:01:43:20
 ```
 
----
-
-## 5. 时间同步（可选但推荐）
-
-向 ESP32 发送一次时间同步，使输出的时间戳为 Unix 毫秒时间：
+### 4. 编译 ROS2 包
 
 ```bash
-python3 - <<'PY'
-import serial, time
-port = '/dev/ttyACM0'
-now_ms = int(time.time() * 1000)
-with serial.Serial(port, 115200, timeout=1) as s:
-    s.write(f'TS>{now_ms}\n'.encode())
-    s.flush()
-    for _ in range(8):
-        line = s.readline().decode(errors='ignore').strip()
-        if line:
-            print(line)
-PY
-```
-
-期望看到 `DEBUG: Received time sync request: TS>...`，此后 `BAROD>` 行的时间戳变为正常的毫秒时间。
-
----
-
-## 6. ROS2 节点：串口桥接
-
-### 6.1 构建 ROS 工作区
-
-```bash
-source /opt/ros/humble/setup.bash
 cd ros_barometer-main
 colcon build --symlink-install
 source install/setup.bash
 ```
 
-### 6.2 启动串口桥接节点
-
-单板模式使用 `output_mode:=self-relative`，并指定当地参考气压：
+### 5. 启动节点
 
 ```bash
-ros2 run serial_to_ros2 esp32_serial_baro \
-    --ros-args \
-    -p serial_port:=/dev/ttyACM0 \
-    -p output_mode:=self-relative \
-    -p default_local_pressure:=1005.0
+ros2 launch serial_to_ros2 baro_p_alti_launch.py
 ```
 
-> `default_local_pressure` 的值填你所在楼层实测的稳定气压（单位 hPa）。
+启动后控制台输出示例：
 
-### 6.3 查看话题数据
+```
+[INFO] Starting baseline calibration: collecting pressure for 10.0s
+[INFO] Calibration sample 1: 1005.23 hPa
+...
+[INFO] Baseline calibration done: 1005.19 hPa (UG layer, 198 samples over 10.1s)
+[INFO] First altitude: 0.023 m
+```
 
-新终端：
+---
+
+## 系统工作原理
+
+### 上电自动校准（核心新功能）
+
+传统方法需要手动测量当地气压填入配置文件，本系统实现了**全自动校准**：
+
+```
+上电 → ESP32 开始输出 BAROD> 数据
+  ↓
+ROS2 节点进入校准阶段（默认 10 秒）
+    → 每收到一帧数据就记录气压值
+    → 只发布 /pressure 原始气压（不发布海拔）
+    → 等待 10 秒收集足够样本
+  ↓
+10 秒结束 → 计算所有样本的均值 = UG 层基准气压
+  ↓
+发出 /baseline_pressure 话题（基准气压值，只发一次）
+  ↓ 自动更新 default_local_pressure
+  ↓
+进入正常阶段：
+  → 用 ISA 大气模型算海拔（基于 UG 基准气压）
+  → 海拔 / 层高 = 楼层号 → 持续发 /floor_estimate
+  → 同时发布 /pressure + /barometer + /z_motion
+```
+
+校准完成后，海拔计算以 UG 层为参考零点，因此：
+- 在 UG 层时 `altitude ≈ 0m`
+- 在 1F 时 `altitude ≈ 3m`（取决于 `floor_height` 参数）
+- 在 B1（地下一层）时 `altitude ≈ -3m`
+
+### 固件数据流
+
+```
+BMP390 传感器（50Hz ODR，IIR Coeff 1）
+  │ 每 50ms 读取一次气压和温度
+  ▼
+ESP32 主循环
+  │ 输出 BAROD>时间戳,气压hPa,温度°C
+  │ 每秒发送一次 BAROT> 请求时间同步
+  │ 收到 TS> 后更新本地时钟
+  ▼
+USB 串口（115200 bps）
+```
+
+### ROS2 节点数据流
+
+```
+USB 串口 → serial_reader_task（异步读取）
+  │
+  ▼
+_process_serial_line → _serial_raw_to_pressure
+  │
+  ├─ 校准未完成: 收集样本，仅发 /pressure
+  │                    10s 后算出基准气压
+  │                    发 /baseline_pressure（仅一次）
+  │
+  └─ 校准完成: 算 ISA 海拔 → 发 /barometer（含 altitude）
+                          → 算楼层 → 发 /floor_estimate
+                          → 回读 /barometer
+                              → 有限差分法算垂直速度/加速度
+                              → 发 /z_motion
+```
+
+---
+
+## ROS2 话题列表
+
+| 话题 | 类型 | 频率 | 说明 |
+|------|------|------|------|
+| `/pressure` | `sensor_msgs/FluidPressure` | ~20Hz | 原始气压（Pa），校准期间也发布 |
+| `/barometer` | `barometer_interfaces/Barometer` | ~20Hz | 含海拔(altitude)、气压、温度，校准后才发布 |
+| `/z_motion` | `barometer_interfaces/ZMotion` | ~20Hz | 垂直速度(vspeed)和加速度(vacc) |
+| `/baseline_pressure` | `std_msgs/Float32` | 仅 1 次 | UG 层基准气压值(hPa)，校准完成时发布 |
+| `/floor_estimate` | `std_msgs/Int32` | ~20Hz | 当前楼层号（0=UG, 1=1F, -1=B1），校准后才发布 |
+
+### 话题消息结构
+
+**Barometer.msg**
+```
+std_msgs/Header header
+float32 altitude     # 海拔高度（米），相对于 UG 基准气压
+float32 pressure     # 气压（帕斯卡）
+float32 temperature  # 温度（摄氏度）
+```
+
+**ZMotion.msg**
+```
+std_msgs/Header header
+float32 vspeed   # 垂直速度 (m/s)，正值为上升
+float32 vacc     # 垂直加速度 (m/s²)
+```
+
+---
+
+## 配置参数
+
+配置文件：`ros_barometer-main/serial_to_ros2/config/esp32_serial_baro.yaml`
+
+```yaml
+esp32_serial_baro:
+  ros__parameters:
+    serial_port: /dev/ttyACM0          # ESP32 串口设备路径
+    output_mode: self-relative         # 单板模式（固定）
+    frequency: 5.0                     # 节点内频率（不影响实际数据率）
+    default_local_pressure: 1004.0     # 校准前的临时参考气压（会被校准值覆盖）
+    calibration_duration: 10.0         # 上电采集校准时长（秒）
+    floor_height: 3.0                  # 每层楼高度（米）
+    longitude: 121.6                   # 经度（不影响单板模式，保留）
+    latitude: 31.68                    # 纬度（不影响单板模式，保留）
+    cali_offsets:                      # 传感器偏移校准
+      MOBILE_MAC_UNDERSCORE:
+        pressure_offset: 0.0
+        temperature_offset: 0.0
+        linear_factor: 1.0
+```
+
+### 参数说明
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `serial_port` | `/dev/ttyACM0` | ESP32 串口设备路径，留空会自动扫描 |
+| `calibration_duration` | `10.0` | 上电后采集多少秒气压作为 UG 基准 |
+| `floor_height` | `3.0` | 每层楼高度（米），用于计算楼层号 |
+| `default_local_pressure` | `1004.0` | 校准前的临时值，校准完成后会被自动覆盖 |
+| `frequency` | `5.0` | 内部轮询频率（实际数据率由 ESP32 20Hz 主导） |
+
+---
+
+## 命令行参数覆盖
+
+可通过 `--ros-args -p` 临时覆盖参数：
+
+```bash
+# 校准时长改为 15 秒
+ros2 run serial_to_ros2 esp32_serial_baro \
+    --ros-args -p serial_port:=/dev/ttyACM0 \
+    -p calibration_duration:=15.0
+
+# 层高改为 3.5 米
+ros2 run serial_to_ros2 esp32_serial_baro \
+    --ros-args -p serial_port:=/dev/ttyACM0 \
+    -p floor_height:=3.5
+```
+
+---
+
+## 调试与查看数据
+
+### 新开终端查看话题
 
 ```bash
 source /opt/ros/humble/setup.bash
 source ros_barometer-main/install/setup.bash
+
+# 查看基准气压（校准完成后才会出现）
+ros2 topic echo /baseline_pressure --once
+
+# 实时监听楼层
+ros2 topic echo /floor_estimate
+
+# 查看完整数据
 ros2 topic echo /barometer --once
+
+# 查看所有活跃话题
+ros2 topic list
 ```
 
-期望输出：
+### 预期输出
 
-```
+**校准阶段（前 10 秒）：**
+```bash
+$ ros2 topic echo /pressure --once
 header:
   stamp:
     sec: 1775629956
     nanosec: 165000000
   frame_id: barometer_link
-altitude: 79.3833
-pressure: 100564.0
-temperature: 29.49
+fluid_pressure: 100523.0    # 单位 Pa（= 1005.23 hPa）
+variance: 0.0
+```
+
+**校准完成后：**
+```bash
+$ ros2 topic echo /barometer --once
+header:
+  stamp:
+    sec: 1775629966
+    nanosec: 65000000
+  frame_id: barometer_link
+altitude: 2.85              # 相对于 UG 层的高度（米）
+pressure: 100491.0          # 单位 Pa
+temperature: 28.95          # 单位 °C
+
+$ ros2 topic echo /floor_estimate --once
+data: 1                     # 当前在 1F
+
+$ ros2 topic echo /baseline_pressure --once
+data: 1005.19               # UG 层基准气压（hPa）
 ```
 
 ---
 
-## 7. 确定参考气压
+## 时间同步
 
-在**已知楼层**（如 1 楼）观察气压稳定值：
+ESP32 固件实现了自动时间同步协议：
 
-```bash
-ros2 topic echo /barometer --once | grep pressure
-```
+- 上电后每秒发送一次 `BAROT>` 请求
+- ROS2 节点收到后回复 `TS><unix_ms>` 时间戳
+- ESP32 更新本地 RTC，后续 `BAROD>` 中的时间戳即为正确的 Unix 毫秒时间
+- 每 2 小时重新同步一次，补偿时钟漂移
 
-例如读到 `1006.04 hPa`，则重启桥接节点时填入：
-
-```bash
-ros2 run serial_to_ros2 esp32_serial_baro \
-    --ros-args \
-    -p serial_port:=/dev/ttyACM0 \
-    -p output_mode:=self-relative \
-    -p default_local_pressure:=1006.04
-```
-
-此时话题中的 `altitude` 即为相对于参考楼层的海拔差（单位米）。
-
----
-
-## 8. 实时楼层验证
-
-启动桥接节点后，另开终端运行楼层预测脚本：
-
-```bash
-source /opt/ros/humble/setup.bash
-source ros_barometer-main/install/setup.bash
-
-python3 ESP32_Barometer-main/tools/realtime_floor_validation.py \
-    --duration 120 \
-    --live-interval 1 \
-    --floor-height 3 \
-    --floor-count 5
-```
-
-参数说明：
-
-| 参数 | 含义 |
-|------|------|
-| `--duration` | 采集时长（秒） |
-| `--live-interval` | 输出间隔（秒） |
-| `--floor-height` | 每层楼高度（米） |
-| `--floor-count` | 总楼层数 |
-
-脚本会订阅 `/barometer` 话题，根据 `altitude` 实时推算当前楼层并输出结果。
-
----
-
-## 系统架构（单板）
-
-```
-ESP32-S3 + BMP390
-    │
-    ├─ USB Serial (/dev/ttyACM0)
-    │
-    ▼
-esp32_serial_baro (ROS2 node)
-    │
-    ├─ output_mode=self-relative
-    ├─ default_local_pressure=<参考气压>
-    │
-    ▼
-/barometer topic
-    │
-    ▼
-realtime_floor_validation.py
-    │
-    ▼
-楼层估计结果
-```
+此过程**非阻塞**，上电立即输出数据，不影响采集。
 
 ---
 
 ## 常见问题
 
 **Q: 串口设备不是 `/dev/ttyACM0`？**
-A: 用 `ls /dev/ttyACM*` 或 `ls /dev/ttyUSB*` 查看实际设备名，在启动桥接节点时修改 `serial_port` 参数。
+A: 用 `ls /dev/ttyACM*` 或 `ls /dev/ttyUSB*` 查看实际设备名，修改 YAML 配置或启动时用 `-p serial_port:=/dev/ttyACM1`。
 
-**Q: 参考气压怎么获取最准确？**
-A: 将设备放在已知楼层静止 1-2 分钟，取 `ros2 topic echo /barometer --once` 中 `pressure` 的稳定值。
+**Q: 校准 10 秒不够/太长？**
+A: 修改 `calibration_duration` 参数。一般 10 秒足够（约 200 个样本），楼层环境越稳定时间越短。
+
+**Q: 楼层号不对？**
+A: 调整 `floor_height` 参数匹配实际楼层高度。标准层高通常 3m，商住楼可能有差异。
+
+**Q: 高度变化响应慢？**
+A: 当前固件已优化：采样 50ms，IIR 滤波系数 1。如需更快可在 `HP206C.cpp` 中关闭 IIR 滤波（`BMP3_IIR_FILTER_COEFF_0`），但噪声会略微增加。
+
+**Q: `colcon build` 时报找不到 `barometer_interfaces`？**
+A: 先编译消息包：
+```bash
+cd ros_barometer-main
+colcon build --packages-select barometer_interfaces
+source install/setup.bash
+colcon build --symlink-install
+```
 
 **Q: ROS2 Humble 不是我的版本？**
-A: 把命令中的 `humble` 替换为你的 ROS2 版本名即可（如 `jazzy`、`rolling`）。
+A: 把命令中的 `humble` 替换为你的 ROS2 版本即可（如 `jazzy`、`rolling`）。
+
+---
+
+## 系统架构
+
+```
+┌─────────────────────────────────────────────────┐
+│               ESP32-S3 + BMP390                 │
+│                                                  │
+│  BMP390 (50Hz ODR, IIR Coeff 1)                 │
+│    ↓ 每 50ms 读取                                  │
+│  collectAndSendData()                            │
+│    ↓                                             │
+│  Serial: BAROD>ts,pressure,temp                  │
+│         BAROT>MAC  (每秒请求时间同步)               │
+└──────────────────────┬──────────────────────────┘
+                       │ USB Serial (115200)
+                       ▼
+┌─────────────────────────────────────────────────┐
+│          ROS2 Node: esp32_serial_baro            │
+│                                                  │
+│  serial_reader_task                              │
+│    ↓                                             │
+│  _process_serial_line                            │
+│    ↓                                             │
+│  _serial_raw_to_pressure                         │
+│    ├─ [校准阶段] 收集10s样本 → 计算均值            │
+│    │              → 发 /baseline_pressure        │
+│    │              → 设置 default_local_pressure  │
+│    │                                             │
+│    └─ [正常运行] ISA海拔换算 → /barometer         │
+│                             → /floor_estimate    │
+│                             → /z_motion          │
+│                                                  │
+│  Publishers:                                     │
+│    /pressure          (FluidPressure)            │
+│    /barometer         (Barometer)                │
+│    /z_motion          (ZMotion)                  │
+│    /baseline_pressure (Float32, 仅一次)           │
+│    /floor_estimate    (Int32, 实时)              │
+└─────────────────────────────────────────────────┘
+```

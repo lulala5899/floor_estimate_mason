@@ -176,10 +176,6 @@ class PressureNode(Node):
         )
         self.default_local_pressure = self.get_parameter(
             'default_local_pressure').get_parameter_value().double_value
-        
-        # Store the default value to check if user provided a custom value
-        self.default_local_pressure_default = default_params.get('default_local_pressure', 1010.0)
-        self.user_provided_local_pressure = (self.default_local_pressure != self.default_local_pressure_default)
 
         self.declare_parameter(
             'calibration_duration',
