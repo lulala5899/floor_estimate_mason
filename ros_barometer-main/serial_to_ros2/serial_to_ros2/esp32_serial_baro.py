@@ -27,12 +27,14 @@ if venv := os.environ.get('VIRTUAL_ENV'):
     pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
     if os.path.isdir(site_packages := os.path.join(venv, 'lib', pyver, 'site-packages')) and site_packages not in sys.path:
         site.addsitedir(site_packages)
-# Keep the import order for virtual environment compatibility
-import aiohttp
-from aiohttp import web
 import serial_asyncio
 import serial
 import serial.tools.list_ports
+
+
+# Floor debouncing constants
+FLOOR_DEBOUNCE_CONSECUTIVE = 5   # consecutive consistent samples to latch
+FLOOR_ALTITUDE_BUFFER_SIZE = 10  # number of altitude samples for median filter
 
 
 def find_serial_port() -> str:
@@ -89,8 +91,6 @@ class PressureNode(Node):
         self.reconnect_delay = 2.0  # seconds
 
         default_params = self._load_default_parameters_from_file()
-        self.cali_offsets = default_params.get('cali_offsets', {})
-        self._warned_unknown_base_macs = set()
 
         self._prev_h = None       # previous altitude (meters)
         self._prev_t = None       # previous time (seconds)
@@ -102,6 +102,11 @@ class PressureNode(Node):
         self.baseline_complete = False
         self.current_floor = 0
 
+        # Floor debouncing state
+        self._altitude_buffer = []           # circular buffer of recent altitudes
+        self._floor_latched = None           # confirmed floor (after debouncing)
+        self._floor_consecutive_count = 0    # how many samples consistent with new floor
+
         self.pub_pressure = self.create_publisher(
             FluidPressure, '/pressure', 10)
         self.pub_barometer = self.create_publisher(
@@ -112,6 +117,8 @@ class PressureNode(Node):
             Float32, '/baseline_pressure', 10)
         self.pub_floor_estimate = self.create_publisher(
             Int32, '/floor_estimate', 10)
+        self.pub_floor_state = self.create_publisher(
+            Int32, '/floor_state', 10)
 
         self.sub_barometer = self.create_subscription(
             Barometer, '/barometer', self._sub_barometer_callback, 10)
@@ -129,13 +136,6 @@ class PressureNode(Node):
                 raise RuntimeError('No serial port found')
             self._info(f'Serial port set to: {self.serial_port}')
 
-        self.declare_parameter('output_mode',
-                               default_params.get(
-                                   'output_mode', 'self-relative'),
-                               ParameterDescriptor(description='self-relative or base-relative output mode'))
-        self.output_mode = self.get_parameter(
-            'output_mode').get_parameter_value().string_value
-
         self.declare_parameter(
             'frequency',
             default_params.get('frequency', 6.0),
@@ -144,29 +144,6 @@ class PressureNode(Node):
         )
         self.frequency = self.get_parameter(
             'frequency').get_parameter_value().double_value
-
-        if self.output_mode == "base-relative":
-            self.declare_parameter(
-                'base_ip',
-                default_params.get('base_ip', ''),
-                ParameterDescriptor(
-                    description='IP address of the base station to fetch base pressure data from')
-            )
-            self.base_ip = self.get_parameter(
-                'base_ip').get_parameter_value().string_value
-            self.pub_base_pressure = self.create_publisher(
-                FluidPressure, '/base/pressure', 10)
-            self.pub_base_barometer = self.create_publisher(
-                Barometer, '/base/barometer', 10)
-
-            self.declare_parameter(
-                'base_pressure_port',
-                default_params.get('base_pressure_port', 18080),
-                ParameterDescriptor(
-                    description='HTTP port for receiving base pressure POST /data')
-            )
-            self.base_pressure_port = self.get_parameter(
-                'base_pressure_port').get_parameter_value().integer_value
 
         self.declare_parameter(
             'default_local_pressure',
@@ -195,31 +172,10 @@ class PressureNode(Node):
         self.floor_height = self.get_parameter(
             'floor_height').get_parameter_value().double_value
 
-        self.declare_parameter(
-            'longitude',
-            default_params.get('longitude', 121.60),
-            ParameterDescriptor(
-                description='Longitude for local pressure fetching')
-        )
-        self.declare_parameter(
-            'latitude',
-            default_params.get('latitude', 31.68),
-            ParameterDescriptor(
-                description='Latitude for local pressure fetching')
-        )
-        self.longitude = self.get_parameter(
-            'longitude').get_parameter_value().double_value
-        self.latitude = self.get_parameter(
-            'latitude').get_parameter_value().double_value
-
         self.mac_address: str | None = None
         self.mac_timer = self.create_timer(1.0, self._send_mac_address)
         self.pressure_offset = 0.0
         self.temperature_offset = 0.0
-
-        # Add server-related attributes
-        self.base_pressure_server = None
-        self.server_runner = None
 
         self._info('PressureNode has been started.')
 
@@ -371,13 +327,51 @@ class PressureNode(Node):
         except Exception as e:
             self._error(f"Failed to send time sync: {e}")
 
+    def _compute_debounced_floor(self, altitude: float) -> int | None:
+        """
+        Debounce floor estimate using median filter + consecutive confirmation.
+        Maintains an internal altitude buffer and latched floor state.
+        Returns new floor value when latched, None otherwise.
+        """
+        # Maintain circular buffer of altitudes
+        self._altitude_buffer.append(altitude)
+        if len(self._altitude_buffer) > FLOOR_ALTITUDE_BUFFER_SIZE:
+            self._altitude_buffer.pop(0)
+
+        # Compute median-based floor from buffer
+        sorted_alt = sorted(self._altitude_buffer)
+        median_alt = sorted_alt[len(sorted_alt) // 2]
+        candidate_floor = int(round(median_alt / self.floor_height))
+
+        # First-ever floor: latch immediately
+        if self._floor_latched is None:
+            self._floor_latched = candidate_floor
+            self._floor_consecutive_count = 0
+            return candidate_floor
+
+        # If candidate matches latched floor, reset counter
+        if candidate_floor == self._floor_latched:
+            self._floor_consecutive_count = 0
+            return None
+
+        # Candidate differs: increment counter, latch when threshold reached
+        self._floor_consecutive_count += 1
+        if self._floor_consecutive_count >= FLOOR_DEBOUNCE_CONSECUTIVE:
+            old_floor = self._floor_latched
+            self._floor_latched = candidate_floor
+            self._floor_consecutive_count = 0
+            self._info(f'Floor latched: {old_floor} -> {candidate_floor}')
+            return candidate_floor
+
+        return None
+
     def _serial_raw_to_pressure(self, line: str):
         try:
             data = re.split(r',\s*', line[6:])  # Skip 'BAROD>' prefix
             if len(data) < 3:
                 self._warn(f'Invalid data format: {line}')
                 return None
-            
+
             try:
                 pressure_from_sensor = float(data[1])
                 temp_from_sensor = float(data[2])
@@ -394,7 +388,7 @@ class PressureNode(Node):
             except ValueError:
                 self._warn(f"Could not parse float from sensor data in line: {line}")
                 return None
-        
+
             timestamp = float(data[0])
             # Convert timestamp from milliseconds to ROS2 time
             timestamp_sec = int(timestamp // 1000)
@@ -404,7 +398,7 @@ class PressureNode(Node):
             header.stamp.sec = timestamp_sec
             header.stamp.nanosec = timestamp_nanosec
             header.frame_id = "barometer_link"
-            
+
             # Pressure in Pascals
             pressure_hpa = pressure_from_sensor + self.pressure_offset
             pressure_pa = pressure_hpa * 100.0
@@ -463,9 +457,15 @@ class PressureNode(Node):
                 )
             )
 
-            # --- Floor estimate ---
+            # --- Floor estimate (fast, raw, no debouncing) ---
             self.current_floor = int(round(altitude / self.floor_height))
             self.pub_floor_estimate.publish(Int32(data=self.current_floor))
+
+            # --- Floor state (debounced, latched) ---
+            latched_floor = self._compute_debounced_floor(altitude)
+            if latched_floor is not None:
+                self.pub_floor_state.publish(Int32(data=latched_floor))
+
         except Exception as e:
             self._warn(f'Parse error: {e}')
             return None
@@ -526,17 +526,6 @@ class PressureNode(Node):
             if self.mac_timer is not None:
                 self.destroy_timer(self.mac_timer)
                 self.mac_timer = None
-
-            # use the MAC address to identify connected barometer's calibration offsets
-            if self.mac_address in self.cali_offsets:
-                offsets = self.cali_offsets[self.mac_address]
-                self.pressure_offset = offsets.get('pressure_offset', 0.0)
-                self.temperature_offset = offsets.get(
-                    'temperature_offset', 0.0)
-                self._info(f'Got MAC {self.mac_address}, offsets P={self.pressure_offset} hPa, '
-                           f'T={self.temperature_offset} °C')
-            else:
-                self._warn(f'Unknown MAC {self.mac_address}, use zero offsets')
             return
         else:
             self._info(f'ESP32: {line}')
@@ -591,236 +580,10 @@ class PressureNode(Node):
                     await self.close_serial_connection()
                     await asyncio.sleep(self.reconnect_delay)
                     continue
-                    
+
         except asyncio.CancelledError:
             self._info("Serial reader task cancelled")
             raise  # Re-raise to properly handle the cancellation
-    
-    async def _handle_pressure_post(self, request):
-        """Handle POST requests with pressure data"""
-        try:
-            # Parse JSON data from request
-            data = await request.json()
-            
-            # Get Device-Mac from request headers
-            device_mac_header = request.headers.get('Device-Mac')
-            device_mac = device_mac_header.replace(":", "_").upper() if device_mac_header else ""
-            if device_mac:
-                self._debug(f"Received request from device MAC: {device_mac}")
-            else:
-                self._warn("No Device-Mac header found in request")
-                
-            # Extract data from JSON
-            timestamp_ms = data.get('timestamp_ms', 0)
-            
-            try:
-                pressure_hpa = data.get('pressure_hpa', 0.0)
-                temperature_c = data.get('temperature_c', 0.0)
-                if math.isnan(pressure_hpa) or \
-                    math.isinf(pressure_hpa) or \
-                    pressure_hpa < 980.0 or \
-                    pressure_hpa > 1100.0 or \
-                    math.isnan(temperature_c) or \
-                    math.isinf(temperature_c) or \
-                    temperature_c < -20.0 or \
-                    temperature_c > 50.0:
-                    self._warn(f"Received invalid sensor data from base post: {data}")
-                    return web.Response(
-                        text="Base pressure data received successfully",
-                        status=500)
-            except ValueError:
-                self._warn(f"Could not parse float from sensor data in line: {data}")
-                return web.Response(
-                        text="Could not parse float from sensor data",
-                        status=500)
-            
-            # Convert timestamp from milliseconds to ROS2 time
-            timestamp_sec = int(timestamp_ms // 1000)
-            timestamp_nanosec = int((timestamp_ms % 1000) * 1000000)
-            
-            # Create ROS2 message header
-            header = Header()
-            header.stamp.sec = timestamp_sec
-            header.stamp.nanosec = timestamp_nanosec
-            header.frame_id = "base_barometer_link"
-            
-            if device_mac and device_mac in self.cali_offsets:
-                offsets = self.cali_offsets[device_mac]
-                pressure_offset = offsets.get('pressure_offset', 0.0)
-                temperature_offset = offsets.get('temperature_offset', 0.0)
-            else:
-                pressure_offset = 0.0
-                temperature_offset = 0.0
-                if device_mac and device_mac not in self._warned_unknown_base_macs:
-                    self._warn(f"Unknown MAC {device_mac} in base POST, using zero offsets")
-                    self._warned_unknown_base_macs.add(device_mac)
-            
-            # Convert pressure from hPa to Pa and create FluidPressure message
-            pressure_hpa = float(pressure_hpa) + pressure_offset
-            pressure_pa = pressure_hpa * 100.0
-            temperature = float(temperature_c) + temperature_offset
-            altitude = self._altitude_from_pressure(pressure_hpa, temperature)
-            
-            # Publish base pressure data
-            self.pub_base_pressure.publish(
-                FluidPressure(
-                    header=header,
-                    fluid_pressure=pressure_pa,
-                    variance=0.0
-                )
-            )
-            self.pub_base_barometer.publish(
-                Barometer(
-                    header=header,
-                    pressure=pressure_pa,
-                    temperature=temperature,
-                    altitude=altitude
-                )
-            )
-            
-            # Return success response
-            return web.Response(
-                text="Base pressure data received successfully",
-                status=200)
-            
-        except Exception as e:
-            self._error(f"Error processing pressure data: {e}")
-            return web.json_response(
-                {"status": "error", "message": str(e)},
-                status=500
-            )
-
-    async def _setup_base_pressure_server(self, port: int):
-        """Setup the base pressure HTTP server"""
-        try:
-            # Create web application
-            app = web.Application()
-            
-            # Add routes
-            app.router.add_post('/data', self._handle_pressure_post)
-            
-            # Add CORS middleware
-            # async def add_cors_headers(request, handler):
-            #     response = await handler(request)
-            #     response.headers['Access-Control-Allow-Origin'] = '*'
-            #     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-            #     response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
-            #     return response
-            
-            # app.middlewares.append(add_cors_headers)
-            
-            # Setup runner
-            self.server_runner = web.AppRunner(app)
-            await self.server_runner.setup()
-            
-            # Start server
-            site = web.TCPSite(self.server_runner, '0.0.0.0', port)
-            await site.start()
-            
-            self._info(f"Base pressure server started on port {port}")
-            self._info("Endpoints: POST /data (receive data)")
-
-            return True
-            
-        except Exception as e:
-            self._error(f"Failed to setup base pressure server: {e}")
-            return False
-
-    async def _cleanup_base_pressure_server(self):
-        """Cleanup the base pressure server"""
-        try:
-            if self.server_runner:
-                await self.server_runner.cleanup()
-                self.server_runner = None
-                self._info("Base pressure server cleaned up")
-        except Exception as e:
-            self._warn(f"Error cleaning up base pressure server: {e}")
-
-    async def fetch_base_pressure_start(self):
-        """Start the base pressure server"""
-        try:
-            # Setup server
-            success = await self._setup_base_pressure_server(self.base_pressure_port)
-            if not success:
-                self._error("Failed to start base pressure server")
-                return
-            
-            self._info("Base pressure server started successfully")
-            # Server is now running in the background, task can complete
-            
-        except Exception as e:
-            self._error(f"Error starting base pressure server: {e}")
-            await self._cleanup_base_pressure_server()
-            raise
-
-    async def _register_ip_for_base_server(self) -> None:
-        """Register the IP address of the base server"""
-        if not self.base_ip:
-            self._info("base_ip is empty; skipping direct /clientip registration")
-            return
-        timeout = aiohttp.ClientTimeout(total=10)
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(f"http://{self.base_ip}/clientip") as resp:
-                    self._info(f"HTTP POST status: {resp.status}")
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get("status") == "success":
-                            self._info(f"Base server IP registered successfully: {data.get('your_client_ip')}")
-                    if resp.status != 200:
-                        self._warn(f"Failed to register base server IP")
-                        return
-        except Exception as e:
-            self._error(f"Error registering base server IP: {e}")
-            return
-        
-    async def fetch_local_pressure(self) -> float:
-        """
-        Asynchronously fetches local(ShanghaiTech University) mean sea level pressure (MSL pressure) in hPa
-        from the Open-Meteo API for the given latitude and longitude.
-
-        Parameters:
-            latitude (float): Latitude,
-            longitude (float): Longitude,
-
-        Returns:
-            float: Pressure in hPa, or float('nan') if failed
-        """
-        url = (
-            f"https://api.open-meteo.com/v1/forecast"
-            f"?latitude={self.latitude}&longitude={self.longitude}&current=pressure_msl"
-        )
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/135.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-        }
-
-        timeout = aiohttp.ClientTimeout(total=10)
-        try:
-            self._info(f"Fetching MSL pressure from {url}")
-            # — Potential optimization: reuse a ClientSession across multiple calls
-            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-                async with session.get(url) as resp:
-                    self._info(f"MSL HTTP GET status: {resp.status}")
-                    if resp.status != 200:
-                        text = await resp.text()
-                        self._warn(f"Unexpected status {resp.status}: {text}")
-                        return float("nan")
-
-                    data = await resp.json()
-                    pressure = data.get("current", {}).get("pressure_msl")
-                    if isinstance(pressure, (int, float)) and not math.isnan(pressure):
-                        return float(pressure)
-
-                    self._error( "Invalid or missing 'pressure_msl' in response JSON")
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self._error(f"Error fetching local pressure: {e}")
-
-        return float("nan")
 
 
 async def async_main(args=None):
@@ -851,23 +614,13 @@ async def async_main(args=None):
         # so skip the Open-Meteo API fetch. default_local_pressure from YAML is used
         # as a temporary fallback until calibration (10s) completes.
         node._info("Baseline pressure will be calibrated from sensor data on startup (10s)")
-            
-        if node.output_mode == "base-relative":
-            # Start base pressure server task
-            base_pressure_task = asyncio.create_task(node.fetch_base_pressure_start())
-            
-            # Register IP for base server if output mode is base-relative
-            register_ip_task = asyncio.create_task(node._register_ip_for_base_server())
-            
-            # Wait for all tasks
-            await asyncio.gather(executor_task, register_ip_task, serial_task, base_pressure_task)
-        else:
-            # Wait for both tasks (original behavior)
-            await asyncio.gather(executor_task, serial_task)
+
+        # Wait for both tasks
+        await asyncio.gather(executor_task, serial_task)
 
     except (KeyboardInterrupt, asyncio.CancelledError):
         node._info("Received shutdown signal, cleaning up...")
-        
+
         # Cancel tasks gracefully
         if serial_task and not serial_task.done():
             serial_task.cancel()
@@ -875,31 +628,20 @@ async def async_main(args=None):
                 await asyncio.wait_for(serial_task, timeout=2.0)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
-        
-        # Cancel base pressure task if running
-        if 'base_pressure_task' in locals() and base_pressure_task and not base_pressure_task.done():
-            base_pressure_task.cancel()
-            try:
-                await asyncio.wait_for(base_pressure_task, timeout=2.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                pass
-                
+
         if executor_task and not executor_task.done():
             executor_task.cancel()
             try:
                 await asyncio.wait_for(executor_task, timeout=2.0)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
-    
+
     except Exception as e:
         node._error(f"Error in async_main: {e}")
     finally:
         # Clean up serial connection
         await node.close_serial_connection()
-        
-        # Clean up base pressure server
-        await node._cleanup_base_pressure_server()
-        
+
         # Clean up ROS2 resources
         try:
             if executor:
@@ -907,13 +649,12 @@ async def async_main(args=None):
             node.destroy_node()
         except Exception as e:
             node._warn(f"Error during node cleanup: {e}")
-            
+
         # Only shutdown if not already shut down
         try:
             if rclpy.ok():
                 rclpy.shutdown()
         except Exception as e:
-            # Suppress RClPy shutdown errors as they're often harmless
             pass
 
 
