@@ -8,7 +8,7 @@ esp32_serial_baro:
     calibration_duration: 10.0
     floor_height: 3.0
     # Sensor offset: subtracts mount height so altitude is ground-relative
-    mount_height_offset: 1.0
+    mount_height_offset: 0.0
     # Floor stability: how many raw floor samples must match to confirm stable
     floor_stability_window: 5
     # Heartbeat: unconditional /floor_state re-publish interval (0 to disable)
