@@ -9,6 +9,7 @@
 // Configuration
 #define DATA_COLLECTION_INTERVAL 50              // 50 milliseconds
 #define TIME_SYNC_INTERVAL (60 * 60 * 2 * 1000) // 2 hour in milliseconds
+#define SENSOR_WATCHDOG_THRESHOLD 20             // consecutive failures before re-init (~1s at 20Hz)
 
 // define onboard LED pin
 constexpr int kOnboardLedPin = 2;
@@ -28,6 +29,7 @@ String deviceMac;
 unsigned long lastDataCollectionTime = 0;
 unsigned long lastTimeSync = 0;
 bool timeIsSynchronized = false;
+uint8_t sensorErrorCount = 0;
 
 // Function declarations
 void collectAndSendData();
@@ -175,16 +177,40 @@ void collectAndSendData()
     // Use the new readAll method which handles measurement start and data reading
     if (!barometer.readAll(&temperature, &pressure))
     {
-        Serial.println("ERROR: Failed to read sensor data!");
+        sensorErrorCount++;
+        Serial.print("ERROR: Failed to read sensor data! (");
+        Serial.print(sensorErrorCount);
+        Serial.println("/20)");
+
+        // Watchdog: re-initialize sensor after consecutive failures
+        if (sensorErrorCount >= SENSOR_WATCHDOG_THRESHOLD)
+        {
+            Serial.println("WATCHDOG: Re-initializing BMP390...");
+            if (barometer.begin())
+            {
+                sensorErrorCount = 0;
+                Serial.println("WATCHDOG: Re-initialization successful");
+            }
+            else
+            {
+                Serial.println("WATCHDOG: Re-initialization failed, will retry");
+            }
+        }
         return;
     }
 
     // Check for valid readings
     if (isnan(temperature) || isnan(pressure))
     {
-        Serial.println("ERROR: Invalid sensor readings!");
+        sensorErrorCount++;
+        Serial.print("ERROR: Invalid sensor readings! (");
+        Serial.print(sensorErrorCount);
+        Serial.println("/20)");
         return;
     }
+
+    // Successful read: reset watchdog counter
+    sensorErrorCount = 0;
 
     // Get current timestamp from system time
     unsigned long long now = getUnixMillis();
