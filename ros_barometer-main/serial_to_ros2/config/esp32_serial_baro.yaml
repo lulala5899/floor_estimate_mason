@@ -13,3 +13,5 @@ esp32_serial_baro:
     floor_stability_window: 5
     # Heartbeat: unconditional /floor_state re-publish interval (0 to disable)
     floor_state_heartbeat: 1.0
+    # Floor number offset: shift floor numbering (e.g., 1 for 1-based floors)
+    floor_number_offset: 1

@@ -5,9 +5,11 @@ import time
 import math
 import os
 import sys
+import csv
 import site
 import asyncio
 import concurrent.futures
+from datetime import datetime
 
 import rclpy
 from rclpy.node import Node
@@ -101,6 +103,7 @@ class PressureNode(Node):
         # Floor stability: sliding window of raw floor estimates
         self._raw_floor_window = []
         self._floor_stable = None
+        self._log_count = 0
 
         # Floor state publisher with TRANSIENT_LOCAL so late subscribers get the last value
         floor_state_qos = QoSProfile(
@@ -198,10 +201,29 @@ class PressureNode(Node):
         floor_state_heartbeat = self.get_parameter(
             'floor_state_heartbeat').get_parameter_value().double_value
 
+        self.declare_parameter(
+            'floor_number_offset',
+            0,
+            ParameterDescriptor(
+                description='Offset added to floor numbers (e.g., 1 for 1-based indexing)')
+        )
+        self.floor_number_offset = self.get_parameter(
+            'floor_number_offset').get_parameter_value().integer_value
+
         self.mac_address: str | None = None
         self.mac_timer = self.create_timer(1.0, self._send_mac_address)
         self.pressure_offset = 0.0
         self.temperature_offset = 0.0
+
+        # CSV floor log: local file for post-ride analysis (no network/SSH needed)
+        log_dir = os.path.expanduser('~/floor_estimate_logs')
+        os.makedirs(log_dir, exist_ok=True)
+        log_filename = os.path.join(log_dir, f'floor_log_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
+        self._log_file = open(log_filename, 'w', newline='')
+        self._log_writer = csv.writer(self._log_file)
+        self._log_writer.writerow(['timestamp', 'raw_altitude_m', 'floor_estimate_raw', 'floor_state_stable'])
+        self._log_file.flush()
+        self._info(f'Logging floor data to {log_filename}')
 
         # 1Hz heartbeat: re-publish stable floor so late subscribers always get a value
         if floor_state_heartbeat > 0.0:
@@ -362,7 +384,14 @@ class PressureNode(Node):
     def _publish_floor_state_heartbeat(self):
         """Unconditional 1Hz re-publish so late /floor_state subscribers always get a value."""
         if self._floor_stable is not None:
-            self.pub_floor_state.publish(Int32(data=self._floor_stable))
+            self.pub_floor_state.publish(Int32(data=self._floor_stable + self.floor_number_offset))
+
+    def destroy_node(self):
+        """Close log file on shutdown."""
+        if hasattr(self, '_log_file') and self._log_file and not self._log_file.closed:
+            self._log_file.flush()
+            self._log_file.close()
+        super().destroy_node()
 
     def _compute_stable_floor(self, raw_floor: int) -> int:
         """
@@ -485,11 +514,22 @@ class PressureNode(Node):
 
             # --- Floor estimate (fast, raw, every frame) ---
             self.current_floor = int(round(altitude / self.floor_height))
-            self.pub_floor_estimate.publish(Int32(data=self.current_floor))
+            self.pub_floor_estimate.publish(Int32(data=self.current_floor + self.floor_number_offset))
 
             # --- Floor state (stability-window filtered) ---
             stable_floor = self._compute_stable_floor(self.current_floor)
-            self.pub_floor_state.publish(Int32(data=stable_floor))
+            self.pub_floor_state.publish(Int32(data=stable_floor + self.floor_number_offset))
+
+            # CSV log row (persistent even if SSH disconnects in elevator)
+            self._log_writer.writerow([
+                datetime.now().isoformat(),
+                round(altitude, 3),
+                self.current_floor,
+                stable_floor
+            ])
+            self._log_count += 1
+            if self._log_count % 20 == 0:
+                self._log_file.flush()
 
         except Exception as e:
             self._warn(f'Parse error: {e}')
