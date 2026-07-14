@@ -221,7 +221,7 @@ class PressureNode(Node):
         log_filename = os.path.join(log_dir, f'floor_log_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
         self._log_file = open(log_filename, 'w', newline='')
         self._log_writer = csv.writer(self._log_file)
-        self._log_writer.writerow(['timestamp', 'raw_altitude_m', 'floor_estimate_raw', 'floor_state_stable'])
+        self._log_writer.writerow(['timestamp', 'raw_altitude_m', 'floor_estimate', 'floor_state'])
         self._log_file.flush()
         self._info(f'Logging floor data to {log_filename}')
 
@@ -524,8 +524,8 @@ class PressureNode(Node):
             self._log_writer.writerow([
                 datetime.now().isoformat(),
                 round(altitude, 3),
-                self.current_floor,
-                stable_floor
+                self.current_floor + self.floor_number_offset,
+                stable_floor + self.floor_number_offset
             ])
             self._log_count += 1
             if self._log_count % 20 == 0:
